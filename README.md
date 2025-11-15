@@ -8,7 +8,7 @@ Features
 - High-level `StreamReader`/`StreamWriter` abstractions for bytes, files, multipart uploads, and generic readers.
 - Disk-backed `TempFile` helper that behaves like both reader and writer and cleans itself up automatically.
 - `Pipeline` utility for chaining multi-stage transformations while managing intermediate artifacts.
-- Session-scoped `ProcessIO` manager that isolates temp directories per request/job and ensures cleanup.
+- Session-scoped `ProcessIO` manager that isolates temp directories per request/job and ensures cleanup with configurable writer backends.
 - Sample Fiber HTTP server exposing `/process-by-io` (multipart) and `/process-by-bytes` endpoints for immediate experimentation.
 - Concurrent load tests that stress the HTTP endpoints and catch regressions early.
 
@@ -51,6 +51,23 @@ defer output.Cleanup()
 
 bytes, _ := output.Bytes()
 fmt.Printf("processed %d bytes\n", len(bytes))
+```
+
+### Choosing a session writer type
+By default, `ProcessSession` writes to disk-backed temp files. You can switch to an in-memory writer for small outputs:
+
+```go
+session := processIO.NewSession("example-bytes", streamio.SessionOption{
+	WriterType: streamio.SessionWriterBytes, // or streamio.SessionWriterTempFile
+})
+defer session.Release()
+
+// Override per call (keeps session default untouched)
+output, err := session.Do(ctx, ".zip", func(ctx context.Context, w streamio.StreamWriter) error {
+	reader := streamio.NewBytesStreamReader("payload.bin", payload)
+	_, err := streamio.CopyStream(reader, w)
+	return err
+}, streamio.SessionOption{WriterType: streamio.SessionWriterTempFile})
 ```
 
 HTTP Server

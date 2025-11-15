@@ -1,10 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
+	"time"
 
 	"github.com/dreamph/streamio"
 
@@ -17,7 +23,9 @@ func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
 		return nil, fmt.Errorf("processIO is required")
 	}
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		BodyLimit: 100 * 1024 * 1024,
+	})
 
 	app.Post("/process-by-io", func(c *fiber.Ctx) error {
 		fileHeader, err := c.FormFile("file")
@@ -25,40 +33,37 @@ func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
 			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field \"file\"")
 		}
 
-		reader := streamio.NewMultipartStreamReader(fileHeader)
-		defer reader.Cleanup()
+		inReader := streamio.NewMultipartStreamReader(fileHeader)
+		defer inReader.Cleanup()
 
 		outputExt := filepath.Ext(fileHeader.Filename)
 		if outputExt == "" {
 			outputExt = ".bin"
 		}
 
-		session := processIO.NewSession(uuid.New().String())
+		session := processIO.NewSession(uuid.New().String(), streamio.SessionOption{WriterType: streamio.SessionWriterTempFile})
 		defer session.Release()
 
 		ctx := requestContext(c)
 
 		result, err := session.Do(ctx, outputExt, func(ctx context.Context, out streamio.StreamWriter) error {
-			_, err := streamio.CopyStream(reader, out)
+			_, err := streamio.CopyStream(inReader, out)
 			return err
 		})
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("process failed: %v", err))
 		}
-		defer result.Cleanup()
 
-		streamReader := result.AsStreamReader()
-		stream, err := streamio.OpenReader(streamReader)
+		streamReader := result.Keep().AsStreamReader()
+		reader, err := streamReader.Open()
 		if err != nil {
-			_ = streamReader.Cleanup()
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("open reader failed: %v", err))
 		}
-		defer stream.Close()
-		defer streamReader.Cleanup()
 
 		c.Type("application/octet-stream")
 		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", "processed"+outputExt))
-		return c.SendStream(stream)
+
+		return c.SendStream(reader)
 	})
 
 	app.Post("/process-by-bytes", func(c *fiber.Ctx) error {
@@ -67,18 +72,23 @@ func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
 			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field \"file\"")
 		}
 
-		reader := streamio.NewMultipartStreamReader(fileHeader)
-		defer reader.Cleanup()
-
-		writer := streamio.NewBytesStreamWriter()
-
-		if _, err := streamio.CopyStream(reader, writer); err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("process failed: %v", err))
+		file, err := fileHeader.Open()
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("open upload failed: %v", err))
 		}
+		defer file.Close()
+
+		data, err := io.ReadAll(file)
+		if err != nil {
+			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("read upload failed: %v", err))
+		}
+
+		var out bytes.Buffer
+		out.Write(data)
 
 		c.Type("application/octet-stream")
 		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", fileHeader.Filename))
-		return c.Send(writer.Bytes())
+		return c.Send(out.Bytes())
 	})
 
 	return app, nil
@@ -96,10 +106,34 @@ func main() {
 		log.Fatalf("newServerApp: %v", err)
 	}
 
+	shutdownCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- app.Listen(":8080")
+	}()
+
 	log.Println("server listening on :8080")
-	if err := app.Listen(":8080"); err != nil {
-		log.Fatal(err)
+
+	select {
+	case <-shutdownCtx.Done():
+		log.Println("shutdown signal received")
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := app.ShutdownWithContext(ctx); err != nil {
+			log.Printf("server shutdown error: %v", err)
+		}
+		if err := <-serverErr; err != nil {
+			log.Printf("server exited with error: %v", err)
+		}
+	case err := <-serverErr:
+		if err != nil {
+			log.Fatalf("server error: %v", err)
+		}
 	}
+
+	log.Println("server stopped")
 }
 
 func requestContext(c *fiber.Ctx) context.Context {

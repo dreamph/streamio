@@ -904,14 +904,43 @@ func (p *Pipeline) Reset() error {
 // ProcessSession represents one session (e.g. a request or job)
 // and has its own subdirectory for temp files.
 type ProcessSession interface {
-	Do(ctx context.Context, outputExt string, fn func(ctx context.Context, w StreamWriter) error) (*Output, error)
+	Do(ctx context.Context, outputExt string, fn func(ctx context.Context, w StreamWriter) error, opts ...SessionOption) (*Output, error)
 	Release() error
 }
 
 // ProcessIO is the root manager for all temp files.
 type ProcessIO interface {
-	NewSession(id string) ProcessSession
+	NewSession(id string, opts ...SessionOption) ProcessSession
 	Release() error // cleanup the entire baseDir
+}
+
+// SessionWriterType controls how session outputs are written.
+type SessionWriterType string
+
+const (
+	// SessionWriterTempFile stores outputs on disk (default).
+	SessionWriterTempFile SessionWriterType = "tempfile"
+	// SessionWriterBytes keeps outputs in memory using a bytes buffer.
+	SessionWriterBytes SessionWriterType = "bytes"
+)
+
+// SessionOption customizes the behavior of ProcessSession instances.
+type SessionOption struct {
+	WriterType SessionWriterType
+}
+
+func resolveSessionWriterType(defaultType SessionWriterType, opts []SessionOption) SessionWriterType {
+	writerType := defaultType
+	if writerType == "" {
+		writerType = SessionWriterTempFile
+	}
+	for _, opt := range opts {
+		switch opt.WriterType {
+		case SessionWriterTempFile, SessionWriterBytes:
+			writerType = opt.WriterType
+		}
+	}
+	return writerType
 }
 
 // Concrete implementation of ProcessIO.
@@ -960,11 +989,12 @@ type processSession struct {
 	dir      string
 	manager  *processIOImpl
 	tmpFiles []*TempFile
+	writer   SessionWriterType
 }
 
 // NewSession creates a session under baseDir.
 // Generates a UUID if id == "".
-func (m *processIOImpl) NewSession(id string) ProcessSession {
+func (m *processIOImpl) NewSession(id string, opts ...SessionOption) ProcessSession {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -980,6 +1010,7 @@ func (m *processIOImpl) NewSession(id string) ProcessSession {
 		dir:      sessionDir,
 		manager:  m,
 		tmpFiles: make([]*TempFile, 0),
+		writer:   resolveSessionWriterType(SessionWriterTempFile, opts),
 	}
 
 	m.sessions[id] = s
@@ -1032,9 +1063,16 @@ func (s *processSession) Do(
 	ctx context.Context,
 	outputExt string,
 	fn func(ctx context.Context, w StreamWriter) error,
+	opts ...SessionOption,
 ) (*Output, error) {
 	if fn == nil {
 		return nil, fmt.Errorf("ProcessSession.Do: nil fn")
+	}
+
+	writerType := resolveSessionWriterType(s.writer, opts)
+
+	if writerType == SessionWriterBytes {
+		return s.doInMemory(ctx, fn)
 	}
 
 	// Use GenerateFileName for a unique name with the desired extension.
@@ -1092,4 +1130,21 @@ func (s *processSession) unregisterTempFile(target *TempFile) {
 		}
 	}
 	s.tmpFiles = newList
+}
+
+func (s *processSession) doInMemory(
+	ctx context.Context,
+	fn func(ctx context.Context, w StreamWriter) error,
+) (*Output, error) {
+	writer := NewBytesStreamWriter()
+
+	if err := fn(ctx, writer); err != nil {
+		return nil, err
+	}
+
+	data := writer.Bytes()
+	result := make([]byte, len(data))
+	copy(result, data)
+
+	return &Output{bytes: result, session: s}, nil
 }
