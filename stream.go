@@ -564,8 +564,8 @@ type Output struct {
 	bytes []byte
 	tmp   *TempFile
 
-	keep    bool           // <--- new
-	session ProcessSession // <--- optional: link session to remove from tmpFiles
+	keep    bool    // <--- new
+	session Session // <--- optional: link session to remove from tmpFiles
 }
 
 func (o *Output) AsStreamReader() StreamReader {
@@ -899,72 +899,72 @@ func (p *Pipeline) Reset() error {
 	return nil
 }
 
-/* ---------- ProcessIO / ProcessSession (Session-based temp manager) ---------- */
+/* ---------- Session Manager (Session-based temp manager) ---------- */
 
-// ProcessSession represents one session (e.g. a request or job)
-// and has its own subdirectory for temp files.
-type ProcessSession interface {
+// Session represents one request/job scope and has its own
+// subdirectory for temp files.
+type Session interface {
 	Do(ctx context.Context, outputExt string, fn func(ctx context.Context, w StreamWriter) error, opts ...SessionOption) (*Output, error)
 	Release() error
 }
 
-// ProcessIO is the root manager for all temp files.
-type ProcessIO interface {
-	NewSession(id string, opts ...SessionOption) ProcessSession
+// IOManager is the root manager for all temp files.
+type IOManager interface {
+	NewSession(id string, opts ...SessionOption) Session
 	Release() error // cleanup the entire baseDir
 }
 
-// SessionWriterType controls how session outputs are written.
-type SessionWriterType string
+// OutputType controls how session outputs are written.
+type OutputType string
 
 const (
-	// SessionWriterTempFile stores outputs on disk (default).
-	SessionWriterTempFile SessionWriterType = "tempfile"
-	// SessionWriterBytes keeps outputs in memory using a bytes buffer.
-	SessionWriterBytes SessionWriterType = "bytes"
+	// OutputTempFile stores results on disk (default).
+	OutputTempFile OutputType = "tempfile"
+	// OutputBytes keeps results in memory using a bytes buffer.
+	OutputBytes OutputType = "bytes"
 )
 
-// SessionOption customizes the behavior of ProcessSession instances.
+// SessionOption customizes the behavior of Session instances.
 type SessionOption struct {
-	WriterType SessionWriterType
+	WriterType OutputType
 }
 
-func resolveSessionWriterType(defaultType SessionWriterType, opts []SessionOption) SessionWriterType {
+func resolveSessionWriterType(defaultType OutputType, opts []SessionOption) OutputType {
 	writerType := defaultType
 	if writerType == "" {
-		writerType = SessionWriterTempFile
+		writerType = OutputTempFile
 	}
 	for _, opt := range opts {
 		switch opt.WriterType {
-		case SessionWriterTempFile, SessionWriterBytes:
+		case OutputTempFile, OutputBytes:
 			writerType = opt.WriterType
 		}
 	}
 	return writerType
 }
 
-// Concrete implementation of ProcessIO.
-type processIOImpl struct {
+// Concrete implementation of IOManager.
+type sessionManager struct {
 	baseDir       string
 	mu            sync.Mutex
-	sessions      map[string]ProcessSession
+	sessions      map[string]Session
 	removeBaseDir bool // true removes baseDir on Release, false keeps it
 }
 
-// NewProcessIO creates a base temp directory for the whole process.
-func NewProcessIO(baseDir ...string) (ProcessIO, error) {
+// NewIOManager creates a base temp directory for the whole process.
+func NewIOManager(baseDir ...string) (IOManager, error) {
 	if len(baseDir) > 0 {
 		processBaseDir := strings.TrimSpace(baseDir[0])
 		if processBaseDir == "" {
-			return nil, fmt.Errorf("NewProcessIO: baseDir must not be empty")
+			return nil, fmt.Errorf("NewIOManager: baseDir must not be empty")
 		}
 		if err := os.MkdirAll(processBaseDir, 0o755); err != nil {
 			return nil, err
 		}
 
-		return &processIOImpl{
+		return &sessionManager{
 			baseDir:       processBaseDir,
-			sessions:      make(map[string]ProcessSession),
+			sessions:      make(map[string]Session),
 			removeBaseDir: false, // user-provided baseDir → keep on Release
 		}, nil
 
@@ -975,26 +975,26 @@ func NewProcessIO(baseDir ...string) (ProcessIO, error) {
 		return nil, err
 	}
 
-	return &processIOImpl{
+	return &sessionManager{
 		baseDir:       processBaseDir,
-		sessions:      make(map[string]ProcessSession),
+		sessions:      make(map[string]Session),
 		removeBaseDir: true, // temp dir → safe to delete
 	}, nil
 
 }
 
-// processSession is the default implementation of ProcessSession.
+// processSession is the default implementation of Session.
 type processSession struct {
 	id       string
 	dir      string
-	manager  *processIOImpl
+	manager  *sessionManager
 	tmpFiles []*TempFile
-	writer   SessionWriterType
+	writer   OutputType
 }
 
 // NewSession creates a session under baseDir.
 // Generates a UUID if id == "".
-func (m *processIOImpl) NewSession(id string, opts ...SessionOption) ProcessSession {
+func (m *sessionManager) NewSession(id string, opts ...SessionOption) Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1010,15 +1010,15 @@ func (m *processIOImpl) NewSession(id string, opts ...SessionOption) ProcessSess
 		dir:      sessionDir,
 		manager:  m,
 		tmpFiles: make([]*TempFile, 0),
-		writer:   resolveSessionWriterType(SessionWriterTempFile, opts),
+		writer:   resolveSessionWriterType(OutputTempFile, opts),
 	}
 
 	m.sessions[id] = s
 	return s
 }
 
-// Release removes every session and the ProcessIO base directory.
-func (m *processIOImpl) Release() error {
+// Release removes every session and the SessionManager base directory.
+func (m *sessionManager) Release() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1030,7 +1030,7 @@ func (m *processIOImpl) Release() error {
 			firstErr = err
 		}
 	}
-	m.sessions = make(map[string]ProcessSession)
+	m.sessions = make(map[string]Session)
 
 	// 2) Sweep files not tracked by sessions (e.g. kept outputs).
 	if m.baseDir != "" {
@@ -1066,12 +1066,12 @@ func (s *processSession) Do(
 	opts ...SessionOption,
 ) (*Output, error) {
 	if fn == nil {
-		return nil, fmt.Errorf("ProcessSession.Do: nil fn")
+		return nil, fmt.Errorf("Session.Do: nil fn")
 	}
 
 	writerType := resolveSessionWriterType(s.writer, opts)
 
-	if writerType == SessionWriterBytes {
+	if writerType == OutputBytes {
 		return s.doInMemory(ctx, fn)
 	}
 

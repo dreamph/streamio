@@ -49,15 +49,15 @@ func TestProcessEndpointsHandleConcurrentLoad(t *testing.T) {
 func newTestApp(t *testing.T) *fiber.App {
 	t.Helper()
 
-	processIO, err := streamio.NewProcessIO("/Users/dream/Data/projects/dreamph/streamio/tmp")
+	ioManager, err := streamio.NewIOManager("/Users/dream/Data/projects/dreamph/streamio/tmp")
 	if err != nil {
-		t.Fatalf("streamio.NewProcessIO: %v", err)
+		t.Fatalf("streamio.NewIOManager: %v", err)
 	}
 	t.Cleanup(func() {
-		_ = processIO.Release()
+		_ = ioManager.Release()
 	})
 
-	app, err := newServerApp(processIO)
+	app, err := newServerApp(ioManager)
 	if err != nil {
 		t.Fatalf("newServerApp: %v", err)
 	}

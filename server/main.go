@@ -18,9 +18,9 @@ import (
 	"github.com/google/uuid"
 )
 
-func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
-	if processIO == nil {
-		return nil, fmt.Errorf("processIO is required")
+func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
+	if ioManager == nil {
+		return nil, fmt.Errorf("IO manager is required")
 	}
 
 	app := fiber.New(fiber.Config{
@@ -41,7 +41,7 @@ func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
 			outputExt = ".bin"
 		}
 
-		session := processIO.NewSession(uuid.New().String(), streamio.SessionOption{WriterType: streamio.SessionWriterTempFile})
+		session := ioManager.NewSession(uuid.New().String(), streamio.SessionOption{WriterType: streamio.OutputTempFile})
 		defer session.Release()
 
 		ctx := requestContext(c)
@@ -95,13 +95,13 @@ func newServerApp(processIO streamio.ProcessIO) (*fiber.App, error) {
 }
 
 func main() {
-	processIO, err := streamio.NewProcessIO()
+	ioManager, err := streamio.NewIOManager()
 	if err != nil {
-		log.Fatalf("streamio.NewProcessIO: %v", err)
+		log.Fatalf("streamio.NewIOManager: %v", err)
 	}
-	defer processIO.Release()
+	defer ioManager.Release()
 
-	app, err := newServerApp(processIO)
+	app, err := newServerApp(ioManager)
 	if err != nil {
 		log.Fatalf("newServerApp: %v", err)
 	}
