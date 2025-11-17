@@ -19,7 +19,7 @@ import (
 
 func TestProcessEndpointsHandleConcurrentLoad(t *testing.T) {
 	app := newTestApp(t)
-	payload := bytes.Repeat([]byte("streamio-load-test-"), 1000000) // ~10KB payload
+	payload := bytes.Repeat([]byte("streamio-load-test-"), 10000000)
 
 	t.Run("process-by-io", func(t *testing.T) {
 		beforeMem := captureMemSnapshot()
@@ -44,6 +44,21 @@ func TestProcessEndpointsHandleConcurrentLoad(t *testing.T) {
 		t.Logf("/process-by-bytes handled %d requests in %s (avg %s/request)", total, duration, duration/time.Duration(total))
 		logMemUsage(t, "process-by-bytes", beforeMem, afterMem)
 	})
+}
+
+func TestProcessByIOUsesLessHeapThanBytes(t *testing.T) {
+	app := newTestApp(t)
+	payload := bytes.Repeat([]byte("streamio-load-test-"), 64*1024)
+
+	ioStats := runLoadAndMeasure(t, app, "/process-by-io", payload, 2, 3)
+	bytesStats := runLoadAndMeasure(t, app, "/process-by-bytes", payload, 2, 3)
+
+	if ioStats.totalAllocDelta > bytesStats.totalAllocDelta {
+		t.Fatalf("expected /process-by-io to allocate <= memory than /process-by-bytes: io=%s bytes=%s",
+			formatBytes(ioStats.totalAllocDelta),
+			formatBytes(bytesStats.totalAllocDelta),
+		)
+	}
 }
 
 func newTestApp(t *testing.T) *fiber.App {
@@ -108,6 +123,37 @@ func runLoadTest(t *testing.T, app *fiber.App, requestFactory func() *http.Reque
 	}
 
 	return time.Since(start)
+}
+
+type loadStats struct {
+	allocDelta      uint64
+	totalAllocDelta uint64
+}
+
+func runLoadAndMeasure(
+	t *testing.T,
+	app *fiber.App,
+	path string,
+	payload []byte,
+	workers,
+	iterations int,
+) loadStats {
+	t.Helper()
+	before := captureMemSnapshot()
+	_ = runLoadTest(t, app, func() *http.Request {
+		return newMultipartRequest(t, path, payload)
+	}, payloadValidator(http.StatusOK, payload), workers, iterations)
+	after := captureMemSnapshot()
+
+	stats := loadStats{}
+	if after.alloc > before.alloc {
+		stats.allocDelta = after.alloc - before.alloc
+	}
+	if after.totalAlloc > before.totalAlloc {
+		stats.totalAllocDelta = after.totalAlloc - before.totalAlloc
+	}
+	t.Logf("%s mem delta alloc=%s total=%s", path, formatBytes(stats.allocDelta), formatBytes(stats.totalAllocDelta))
+	return stats
 }
 
 func payloadValidator(expectedStatus int, expectedBody []byte) func(status int, body []byte) error {

@@ -100,6 +100,7 @@ func Reset(rs Reader) error {
 
 /* ---------- Generic io.Reader Implementation (StreamReader) ---------- */
 
+/*
 type genericStreamReader struct {
 	name        string
 	contentType string
@@ -139,6 +140,7 @@ func (s *genericStreamReader) Cleanup() error {
 func NewGenericStreamReader(name, contentType string, r io.Reader) StreamReader {
 	return &genericStreamReader{name: name, contentType: contentType, reader: r}
 }
+*/
 
 /* ---------- Multipart.FileHeader Implementation (StreamReader) ---------- */
 
@@ -625,7 +627,7 @@ func (o *Output) Keep() *Output {
 }
 
 /* ---------- Pipeline Pattern ---------- */
-
+/*
 // Pipeline manages a sequence of file processing stages with automatic temp file management.
 type Pipeline struct {
 	stages    []*Stage
@@ -898,6 +900,7 @@ func (p *Pipeline) Reset() error {
 	p.current = 0
 	return nil
 }
+*/
 
 /* ---------- Session Manager (Session-based temp manager) ---------- */
 

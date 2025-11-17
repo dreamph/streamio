@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -24,7 +25,7 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 	}
 
 	app := fiber.New(fiber.Config{
-		BodyLimit: 100 * 1024 * 1024,
+		BodyLimit: 1000 * 1024 * 1024,
 	})
 
 	app.Post("/process-by-io", func(c *fiber.Ctx) error {
@@ -53,17 +54,34 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 		if err != nil {
 			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("process failed: %v", err))
 		}
-
-		streamReader := result.Keep().AsStreamReader()
-		reader, err := streamReader.Open()
-		if err != nil {
-			return fiber.NewError(fiber.StatusInternalServerError, fmt.Sprintf("open reader failed: %v", err))
-		}
+		result = result.Keep()
 
 		c.Type("application/octet-stream")
 		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", "processed"+outputExt))
 
-		return c.SendStream(reader)
+		streamReader := result.AsStreamReader()
+		c.Context().Response.SetBodyStreamWriter(func(w *bufio.Writer) {
+			reader, err := streamReader.Open()
+			if err != nil {
+				log.Printf("open reader failed: %v", err)
+				return
+			}
+			defer func() {
+				if err := reader.Close(); err != nil {
+					log.Printf("close reader: %v", err)
+				}
+				if err := streamReader.Cleanup(); err != nil {
+					log.Printf("stream reader cleanup: %v", err)
+				}
+				result.Cleanup()
+			}()
+
+			if _, err := io.Copy(w, reader); err != nil {
+				log.Printf("copy response failed: %v", err)
+			}
+		})
+
+		return nil
 	})
 
 	app.Post("/process-by-bytes", func(c *fiber.Ctx) error {
