@@ -12,8 +12,9 @@ import (
 	"strings"
 	"sync"
 
+	"errors"
+
 	"github.com/google/uuid"
-	"github.com/pkg/errors"
 )
 
 /* ---------- Core Types ---------- */
@@ -69,7 +70,7 @@ func newReadStream(rs io.ReadSeeker) Reader {
 // open streamio.StreamReader
 func OpenReader(src StreamReader) (Reader, error) {
 	if src == nil {
-		return nil, errors.Errorf("nil source")
+		return nil, errors.New("nil source")
 	}
 	rs, err := src.Open()
 	if err != nil {
@@ -81,7 +82,7 @@ func OpenReader(src StreamReader) (Reader, error) {
 // open streamio.StreamWriter
 func OpenWriter(dest StreamWriter) (Writer, error) {
 	if dest == nil {
-		return nil, errors.Errorf("nil destination")
+		return nil, errors.New("nil destination")
 	}
 	w, err := dest.Create()
 	if err != nil {
@@ -532,13 +533,6 @@ func NewFileStreamWriter(path string) StreamWriter {
 }
 
 /* ---------- adapters & utilities ---------- */
-
-// Adapt existing io.ReadSeeker into Reader (adds Close no-op)
-type readSeekCloser struct{ io.ReadSeeker }
-
-func (r *readSeekCloser) Close() error          { return nil }
-func NewReadSeekCloser(rs io.ReadSeeker) Reader { return &readSeekCloser{ReadSeeker: rs} }
-
 func CopyStream(src StreamReader, dst StreamWriter) (int64, error) {
 	r, err := OpenReader(src)
 	if err != nil {
@@ -607,6 +601,7 @@ func (o *Output) Path() (string, error) {
 	return o.tmp.Path, nil
 }
 
+// Keep on session and will delete on process release
 func (o *Output) Keep() *Output {
 	if o == nil || o.tmp == nil || o.session == nil {
 		return o
@@ -1098,6 +1093,82 @@ func (s *processSession) Do(
 	return &Output{tmp: tmp, session: s}, nil
 }
 
+func (s *processSession) DoStream(
+	ctx context.Context,
+	in StreamReader,
+	outputExt string,
+	fn func(ctx context.Context, r io.Reader, w io.Writer) error,
+	opts ...SessionOption,
+) (*Output, error) {
+	if fn == nil {
+		return nil, fmt.Errorf("Session.DoStream: nil fn")
+	}
+
+	writerType := resolveSessionWriterType(s.writer, opts)
+
+	if writerType == OutputBytes {
+		return s.doStreamInMemory(ctx, in, fn)
+	}
+
+	// Use GenerateFileName for a unique name with the desired extension.
+	filename := GenerateFileName(outputExt)
+	tmp, err := NewTempFileInDir(s.dir, "proc-", filename)
+	if err != nil {
+		return nil, err
+	}
+
+	// Track the temp file for cleanup on Release.
+	s.tmpFiles = append(s.tmpFiles, tmp)
+
+	r, err := OpenReader(in)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	w, err := OpenWriter(tmp.AsStreamWriter())
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+
+	if err := fn(ctx, r, w); err != nil {
+		_ = tmp.Cleanup()
+		return nil, err
+	}
+
+	return &Output{tmp: tmp, session: s}, nil
+}
+
+func (s *processSession) doStreamInMemory(
+	ctx context.Context,
+	in StreamReader,
+	fn func(ctx context.Context, r io.Reader, w io.Writer) error) (*Output, error) {
+	sw := NewBytesStreamWriter()
+
+	r, err := OpenReader(in)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+
+	w, err := OpenWriter(sw)
+	if err != nil {
+		return nil, err
+	}
+	defer w.Close()
+
+	if err := fn(ctx, r, w); err != nil {
+		return nil, err
+	}
+
+	data := sw.Bytes()
+	result := make([]byte, len(data))
+	copy(result, data)
+
+	return &Output{bytes: result, session: s}, nil
+}
+
 func (s *processSession) Release() error {
 	var firstErr error
 
@@ -1150,4 +1221,72 @@ func (s *processSession) doInMemory(
 	copy(result, data)
 
 	return &Output{bytes: result, session: s}, nil
+}
+
+type DownloadReaderCloser interface {
+	io.Reader
+	io.Closer
+}
+
+type downloadReaderCloser struct {
+	streamReader StreamReader
+	reader       Reader
+	Cleanup      func()
+}
+
+func (d *downloadReaderCloser) Read(p []byte) (int, error) {
+	if d.reader == nil {
+		return 0, io.ErrClosedPipe
+	}
+	return d.reader.Read(p)
+}
+
+func (d *downloadReaderCloser) Close() error {
+	var errs error
+
+	if d.reader != nil {
+		readerCloseErr := d.reader.Close()
+		if readerCloseErr != nil {
+			errs = errors.Join(errs, readerCloseErr)
+		}
+		d.reader = nil
+	}
+
+	if d.streamReader != nil {
+		streamReaderCleanupErr := d.streamReader.Cleanup()
+		if streamReaderCleanupErr != nil {
+			errs = errors.Join(errs, streamReaderCleanupErr)
+		}
+
+		d.streamReader = nil
+	}
+
+	if d.Cleanup != nil {
+		d.Cleanup()
+		d.Cleanup = nil
+	}
+
+	return errs
+}
+
+func NewDownloadReaderCloser(streamReader StreamReader, cleanup ...func()) (DownloadReaderCloser, error) {
+	if streamReader == nil {
+		return nil, fmt.Errorf("nil streamReader")
+	}
+
+	reader, err := OpenReader(streamReader)
+	if err != nil {
+		return nil, err
+	}
+
+	closer := &downloadReaderCloser{
+		streamReader: streamReader,
+		reader:       reader,
+	}
+
+	if len(cleanup) > 0 {
+		closer.Cleanup = cleanup[0]
+	}
+
+	return closer, nil
 }

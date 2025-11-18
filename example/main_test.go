@@ -48,7 +48,7 @@ func TestProcessEndpointsHandleConcurrentLoad(t *testing.T) {
 
 func TestProcessByIOUsesLessHeapThanBytes(t *testing.T) {
 	app := newTestApp(t)
-	payload := bytes.Repeat([]byte("streamio-load-test-"), 64*1024)
+	payload := bytes.Repeat([]byte("streamio-load-test-"), 10000000)
 
 	ioStats := runLoadAndMeasure(t, app, "/process-by-io", payload, 2, 3)
 	bytesStats := runLoadAndMeasure(t, app, "/process-by-bytes", payload, 2, 3)

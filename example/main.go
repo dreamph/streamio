@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -31,7 +30,7 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 	app.Post("/process-by-io", func(c *fiber.Ctx) error {
 		fileHeader, err := c.FormFile("file")
 		if err != nil {
-			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field \"file\"")
+			return fiber.NewError(fiber.StatusBadRequest, "missing multipart form field : file")
 		}
 
 		inReader := streamio.NewMultipartStreamReader(fileHeader)
@@ -59,7 +58,14 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 		c.Type("application/octet-stream")
 		c.Set(fiber.HeaderContentDisposition, fmt.Sprintf("attachment; filename=%q", "processed"+outputExt))
 
-		streamReader := result.AsStreamReader()
+		readerCloser, err := streamio.NewDownloadReaderCloser(result.AsStreamReader())
+		if err != nil {
+			return err
+		}
+
+		return c.SendStream(readerCloser)
+
+		/*streamReader := result.AsStreamReader()
 		c.Context().Response.SetBodyStreamWriter(func(w *bufio.Writer) {
 			reader, err := streamReader.Open()
 			if err != nil {
@@ -82,6 +88,8 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 		})
 
 		return nil
+
+		*/
 	})
 
 	app.Post("/process-by-bytes", func(c *fiber.Ctx) error {
@@ -113,7 +121,7 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 }
 
 func main() {
-	ioManager, err := streamio.NewIOManager()
+	ioManager, err := streamio.NewIOManager("/Users/dream/Data/projects/dreamph/streamio/tmp")
 	if err != nil {
 		log.Fatalf("streamio.NewIOManager: %v", err)
 	}
