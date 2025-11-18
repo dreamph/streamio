@@ -40,13 +40,13 @@ Quick start
 ```go
 ctx := context.Background()
 
-ioManager, err := streamio.NewIOManager()
+ioManager, err := streamio.NewIOManager("/mytemp/app")
 if err != nil {
 	log.Fatalf("io manager: %v", err)
 }
 defer ioManager.Release()
 
-session := ioManager.NewSession("example")
+session := ioManager.NewSession(uuid.New().String())
 defer session.Release()
 
 output, err := session.Do(ctx, ".txt", func(ctx context.Context, w streamio.StreamWriter) error {
@@ -71,7 +71,7 @@ Choosing a session writer
 Sessions default to disk-backed temp files. Switch to an in-memory writer for small outputs, or override per invocation:
 
 ```go
-session := ioManager.NewSession("example", streamio.SessionOption{
+session := ioManager.NewSession(uuid.New().String(), streamio.SessionOption{
 	WriterType: streamio.OutputBytes, // or streamio.OutputTempFile
 })
 defer session.Release()
