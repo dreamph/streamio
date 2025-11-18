@@ -568,35 +568,42 @@ func (o *Output) AsStreamReader() StreamReader {
 	return o.tmp.AsStreamReader()
 }
 
-func (o *Output) Cleanup() {
+func (o *Output) Cleanup() error {
+	var err error
+
+	// Cleanup temp file
 	if o.tmp != nil {
-		_ = o.tmp.Cleanup()
+		err = o.tmp.Cleanup()
+		o.tmp = nil
 	}
+
+	// Release bytes memory
+	o.bytes = nil
+
+	return err
 }
 
 func (o *Output) Bytes() ([]byte, error) {
+	// In-memory output
 	if o.bytes != nil {
 		return o.bytes, nil
 	}
+
+	// File-based output
 	if o.tmp == nil {
 		return nil, fmt.Errorf("no data")
 	}
+
 	if _, err := o.tmp.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	b, err := io.ReadAll(o.tmp)
-	if err != nil {
-		return nil, err
-	}
 
-	o.bytes = b
-
-	return b, nil
+	return io.ReadAll(o.tmp)
 }
 
 func (o *Output) Path() (string, error) {
 	if o.tmp == nil {
-		return "", fmt.Errorf("no tempfile")
+		return "", fmt.Errorf("no tempfile (in-memory output)")
 	}
 	return o.tmp.Path, nil
 }
@@ -621,281 +628,88 @@ func (o *Output) Keep() *Output {
 	return o
 }
 
-/* ---------- Pipeline Pattern ---------- */
-/*
-// Pipeline manages a sequence of file processing stages with automatic temp file management.
-type Pipeline struct {
-	stages    []*Stage
-	tempFiles []*TempFile
-	finalOut  StreamWriter
-	current   int // Track current stage index
-}
-
-// Stage represents a single processing step with input StreamReader and output StreamWriter.
-type Stage struct {
-	input  StreamReader
-	output StreamWriter
-	temp   *TempFile
-}
-
-// ProcessFunc is a function that processes data from input to output.
-type ProcessFunc func(ctx context.Context, input StreamReader, output StreamWriter) error
-
-// NewPipeline creates a new processing pipeline.
-func NewPipeline(input StreamReader, output StreamWriter) *Pipeline {
-	return &Pipeline{
-		stages: []*Stage{{
-			input:  input,
-			output: output,
-		}},
-		tempFiles: make([]*TempFile, 0),
-		finalOut:  output,
-		current:   0,
+func (o *Output) Reader() (io.ReadCloser, error) {
+	// Prioritize bytes (already in memory)
+	if o.bytes != nil {
+		return io.NopCloser(bytes.NewReader(o.bytes)), nil
 	}
+
+	// Fallback to temp file
+	if o.tmp != nil {
+		return o.tmp.Open()
+	}
+
+	return nil, fmt.Errorf("no data")
 }
 
-// Input returns the input StreamReader for this stage.
-func (s *Stage) Input() StreamReader {
-	return s.input
+func (o *Output) WriteTo(w io.Writer) (int64, error) {
+	r, err := o.Reader()
+	if err != nil {
+		return 0, err
+	}
+	defer r.Close()
+
+	return io.Copy(w, r)
 }
 
-// Output returns the output StreamWriter for this stage.
-func (s *Stage) Output() StreamWriter {
-	return s.output
+func (o *Output) Size() (int64, error) {
+	if o.bytes != nil {
+		return int64(len(o.bytes)), nil
+	}
+
+	if o.tmp != nil {
+		return o.tmp.Size(), nil
+	}
+
+	return 0, fmt.Errorf("no data")
 }
 
-// InputReader opens and returns a Reader for this stage's input.
-func (s *Stage) InputReader() (Reader, error) {
-	return OpenReader(s.input)
+// IsInMemory reports whether this output is stored in memory.
+func (o *Output) IsInMemory() bool {
+	return o.bytes != nil
 }
 
-// OutputWriter creates and returns a Writer for this stage's output.
-func (s *Stage) OutputWriter() (Writer, error) {
-	return OpenWriter(s.output)
+// IsFile reports whether this output is stored as a temp file.
+func (o *Output) IsFile() bool {
+	return o.tmp != nil
 }
 
-// Run executes a processing function on the pipeline.
-// Automatically manages stage creation and progression.
-func (p *Pipeline) Run(ctx context.Context, fn ProcessFunc) error {
-	stage, err := p.getOrCreateStage()
+// CopyTo copies the output to a destination StreamWriter.
+func (o *Output) CopyTo(dst StreamWriter) (int64, error) {
+	w, err := OpenWriter(dst)
+	if err != nil {
+		return 0, err
+	}
+	defer w.Close()
+
+	return o.WriteTo(w)
+}
+
+// SaveAs saves the output to a file path.
+func (o *Output) SaveAs(path string) error {
+	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
-	return fn(ctx, stage.Input(), stage.Output())
+	_, err = o.WriteTo(f)
+	return err
 }
 
-// Do is an alias for Run for cleaner syntax.
-func (p *Pipeline) Do(ctx context.Context, fn ProcessFunc) error {
-	return p.Run(ctx, fn)
-}
-
-// getOrCreateStage returns the current stage or creates a new one.
-func (p *Pipeline) getOrCreateStage() (*Stage, error) {
-	// First call: return the initial stage
-	if p.current < len(p.stages) {
-		stage := p.stages[p.current]
-		p.current++
-		return stage, nil
-	}
-
-	// Subsequent calls: create new stages
-	if len(p.stages) == 0 {
-		return nil, fmt.Errorf("no stages in pipeline")
-	}
-
-	lastStage := p.stages[len(p.stages)-1]
-
-	// Create input from last stage's output
-	nextInput, err := p.createInputFromStage(lastStage)
+// Clone creates a copy of this output.
+// For file-based outputs, creates a new temp file.
+func (o *Output) Clone() (*Output, error) {
+	data, err := o.Bytes()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create input from previous output: %w", err)
+		return nil, err
 	}
 
-	// Generate temp file for this stage
-	tempFile, err := p.generateTempFile()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create temp file: %w", err)
-	}
-
-	// Mark the previous stage's temp file for cleanup
-	if lastStage.output != p.finalOut && lastStage.temp != nil {
-		p.tempFiles = append(p.tempFiles, lastStage.temp)
-	}
-
-	stage := &Stage{
-		input:  nextInput,
-		output: tempFile.AsStreamWriter(),
-		temp:   tempFile,
-	}
-	p.stages = append(p.stages, stage)
-	p.current++
-
-	return stage, nil
-}
-
-// createInputFromStage creates a StreamReader from the previous stage's output.
-func (p *Pipeline) createInputFromStage(stage *Stage) (StreamReader, error) {
-	if stage.temp != nil {
-		return stage.temp.AsStreamReader(), nil
-	}
-
-	if fsw, ok := stage.output.(*fileStreamWriter); ok {
-		return NewFileStreamReader(fsw.path)
-	}
-
-	return nil, fmt.Errorf("cannot create input from stage output: unsupported StreamWriter type")
-}
-
-// GetResult returns the final output as a StreamReader.
-func (p *Pipeline) GetResult() (StreamReader, error) {
-	if len(p.stages) == 0 {
-		return nil, fmt.Errorf("no stages in pipeline")
-	}
-
-	lastStage := p.stages[len(p.stages)-1]
-	return p.createInputFromStage(lastStage)
-}
-
-// GetResultMeta returns the FileInfo metadata of the final output.
-func (p *Pipeline) GetResultMeta() (FileInfo, error) {
-	if len(p.stages) == 0 {
-		return FileInfo{}, fmt.Errorf("no stages in pipeline")
-	}
-
-	lastStage := p.stages[len(p.stages)-1]
-
-	// Get path from the last stage
-	var path string
-	if lastStage.temp != nil {
-		path = lastStage.temp.Path
-	} else if fsw, ok := lastStage.output.(*fileStreamWriter); ok {
-		path = fsw.path
-	} else {
-		return FileInfo{}, fmt.Errorf("cannot get metadata: output is not file-based")
-	}
-
-	// Get file info
-	stat, err := os.Stat(path)
-	if err != nil {
-		return FileInfo{}, fmt.Errorf("failed to stat output file: %w", err)
-	}
-
-	return FileInfo{
-		Name:        stat.Name(),
-		Size:        stat.Size(),
-		ContentType: "", // ContentType not stored in os.FileInfo, leave empty
+	// Always create as in-memory output for simplicity
+	return &Output{
+		bytes: append([]byte(nil), data...),
 	}, nil
 }
-
-// GetResultPath returns the final output file path (if applicable).
-func (p *Pipeline) GetResultPath() (string, error) {
-	if len(p.stages) == 0 {
-		return "", fmt.Errorf("no stages in pipeline")
-	}
-
-	lastStage := p.stages[len(p.stages)-1]
-
-	if lastStage.temp != nil {
-		return lastStage.temp.Path, nil
-	}
-
-	if fsw, ok := lastStage.output.(*fileStreamWriter); ok {
-		return fsw.path, nil
-	}
-
-	return "", fmt.Errorf("output is not file-based")
-}
-
-// GetStages returns all stages in the pipeline.
-func (p *Pipeline) GetStages() []*Stage {
-	return p.stages
-}
-
-// StageCount returns the number of stages in the pipeline.
-func (p *Pipeline) StageCount() int {
-	return len(p.stages)
-}
-
-// CleanUp removes all temporary files except the final output.
-func (p *Pipeline) CleanUp() error {
-	var firstErr error
-
-	for _, temp := range p.tempFiles {
-		if temp != nil {
-			if err := temp.Cleanup(); err != nil {
-				if firstErr == nil {
-					firstErr = fmt.Errorf("failed to cleanup temp file %s: %w", temp.Path, err)
-				}
-			}
-		}
-	}
-
-	if len(p.stages) > 0 {
-		lastStage := p.stages[len(p.stages)-1]
-		if lastStage.temp != nil && lastStage.output != p.finalOut {
-			if err := lastStage.temp.Cleanup(); err != nil {
-				if firstErr == nil {
-					firstErr = err
-				}
-			}
-		}
-	}
-
-	return firstErr
-}
-
-// CleanUpAll removes ALL files including the final output.
-func (p *Pipeline) CleanUpAll() error {
-	var firstErr error
-
-	for _, temp := range p.tempFiles {
-		if temp != nil {
-			if err := temp.Cleanup(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-
-	for _, stage := range p.stages {
-		if stage.temp != nil {
-			if err := stage.temp.Cleanup(); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		} else if fsw, ok := stage.output.(*fileStreamWriter); ok {
-			if err := os.Remove(fsw.path); err != nil && !os.IsNotExist(err) && firstErr == nil {
-				firstErr = err
-			}
-		}
-	}
-
-	return firstErr
-}
-
-// generateTempFile creates a unique temporary file for a stage.
-func (p *Pipeline) generateTempFile() (*TempFile, error) {
-	ext := ".tmp"
-	if fsw, ok := p.finalOut.(*fileStreamWriter); ok {
-		if e := filepath.Ext(fsw.path); e != "" {
-			ext = e
-		}
-	}
-
-	prefix := fmt.Sprintf("pipeline-stage%d-", len(p.stages))
-	return NewTempFileWithName(prefix, GenerateFileName(ext))
-}
-
-// Reset clears all stages except the first one and cleans up temp files.
-func (p *Pipeline) Reset() error {
-	if err := p.CleanUp(); err != nil {
-		return err
-	}
-	p.stages = p.stages[:1]
-	p.tempFiles = make([]*TempFile, 0)
-	p.current = 0
-	return nil
-}
-*/
 
 /* ---------- Session Manager (Session-based temp manager) ---------- */
 
@@ -1211,16 +1025,11 @@ func (s *processSession) doInMemory(
 	fn func(ctx context.Context, w StreamWriter) error,
 ) (*Output, error) {
 	writer := NewBytesStreamWriter()
-
 	if err := fn(ctx, writer); err != nil {
 		return nil, err
 	}
 
-	data := writer.Bytes()
-	result := make([]byte, len(data))
-	copy(result, data)
-
-	return &Output{bytes: result, session: s}, nil
+	return &Output{bytes: writer.Bytes(), session: s}, nil
 }
 
 type DownloadReaderCloser interface {

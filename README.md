@@ -1,16 +1,23 @@
 streamio
 ========
 
-`streamio` is a Go module for building streaming file-processing workflows without leaking disk space or juggling raw `io` primitives. It ships with a production-ready Fiber server that demonstrates how to accept multipart uploads, process them through temporary sessions, and stream the results back to clients.
+`streamio` Stream file processing in Go with predictable memory usage via disk-backed sessions and optional in-memory mode.
+
+Contents
+--------
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Choosing a session writer](#choosing-a-session-writer)
+- [License](#license)
 
 Features
 --------
-- High-level `StreamReader`/`StreamWriter` abstractions for bytes, files, multipart uploads, and generic readers.
-- Disk-backed `TempFile` helper that behaves like both reader and writer and cleans itself up automatically.
-- `Pipeline` utility for chaining multi-stage transformations while managing intermediate artifacts.
-- Session-scoped `IOManager` that isolates temp directories per request/job and ensures cleanup with configurable writer backends.
-- Sample Fiber HTTP server exposing `/process-by-io` (multipart) and `/process-by-bytes` endpoints for immediate experimentation.
-- Concurrent load tests that stress the HTTP endpoints and catch regressions early.
+- Unified `StreamReader`/`StreamWriter` interfaces for bytes, files, multipart uploads, and download responses.
+- Auto-cleaned `TempFile` helper that implements `io.Reader`, `io.Writer`, `io.Seeker`, and can be re-opened as a reader or writer at any time.
+- Session-scoped `IOManager` that isolates temp directories, enforces cleanup, and lets you pick output backends (`TempFile` vs in-memory bytes).
+- `CopyStream`, `Output`, and helper utilities for cloning artifacts, saving to disk, or passing data down a multi-stage pipeline.
 
 Requirements
 ------------
@@ -22,18 +29,21 @@ Installation
 go get github.com/dreamph/streamio
 ```
 
-The command above adds the module to your `go.mod`. Import it with:
+Import the module in your project with:
 
 ```go
 import "github.com/dreamph/streamio"
 ```
 
-Library Overview
-----------------
-### Working with temporary outputs
+Quick start
+-----------
 ```go
 ctx := context.Background()
-ioManager, _ := streamio.NewIOManager()
+
+ioManager, err := streamio.NewIOManager()
+if err != nil {
+	log.Fatalf("io manager: %v", err)
+}
 defer ioManager.Release()
 
 session := ioManager.NewSession("example")
@@ -45,56 +55,44 @@ output, err := session.Do(ctx, ".txt", func(ctx context.Context, w streamio.Stre
 	return err
 })
 if err != nil {
-	log.Fatal(err)
+	log.Fatalf("session.Do: %v", err)
 }
 defer output.Cleanup()
 
-bytes, _ := output.Bytes()
-fmt.Printf("processed %d bytes\n", len(bytes))
+data, err := output.Bytes()
+if err != nil {
+	log.Fatalf("read output: %v", err)
+}
+fmt.Printf("processed %d bytes\n", len(data))
 ```
 
-### Choosing a session writer type
-By default, `Session` writes to disk-backed temp files. You can switch to an in-memory writer for small outputs:
+Choosing a session writer
+-------------------------
+Sessions default to disk-backed temp files. Switch to an in-memory writer for small outputs, or override per invocation:
 
 ```go
-session := ioManager.NewSession("example-bytes", streamio.SessionOption{
-		WriterType: streamio.OutputBytes, // or streamio.OutputTempFile
+session := ioManager.NewSession("example", streamio.SessionOption{
+	WriterType: streamio.OutputBytes, // or streamio.OutputTempFile
 })
 defer session.Release()
 
-// Override per call (keeps session default untouched)
-	output, err := session.Do(ctx, ".zip", func(ctx context.Context, w streamio.StreamWriter) error {
-		reader := streamio.NewBytesStreamReader("payload.bin", payload)
-		_, err := streamio.CopyStream(reader, w)
-		return err
-	}, streamio.SessionOption{WriterType: streamio.OutputTempFile})
+// Override per call (session default stays intact)
+output, err := session.Do(ctx, ".zip", func(ctx context.Context, w streamio.StreamWriter) error {
+	reader := streamio.NewBytesStreamReader("payload.bin", payload)
+	_, err := streamio.CopyStream(reader, w)
+	return err
+}, streamio.SessionOption{WriterType: streamio.OutputTempFile})
+if err != nil {
+	log.Fatalf("session.Do override: %v", err)
+}
+defer output.Cleanup()
 ```
-
-HTTP Server
------------
-The `server` package exposes two endpoints that mirror typical ingestion flows:
-
-- `POST /process-by-io`: accepts a multipart file field named `file`, streams the upload via the IO manager, and returns the processed bytes.
-- `POST /process-by-bytes`: accepts a raw request body, echoes the processed payload.
-
-Run the sample server:
-```bash
-go run ./server
-```
-
-Load & Regression Tests
------------------------
-The repository contains concurrency-focused tests (`server/main_test.go`) that issue burst traffic against both routes. Run the whole suite with:
-```bash
-go test ./...
-```
-
-Project Layout
---------------
-- `stream.go`: core library (readers, writers, pipelines, IO manager, temp files).
-- `server/`: Fiber example server plus load tests.
-- `README.md`: you are here.
 
 License
 -------
 Streamio is distributed under the MIT License. See `LICENSE` for details.
+
+
+Buy Me a Coffee
+=======
+[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/dreamph)

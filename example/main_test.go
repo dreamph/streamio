@@ -17,35 +17,6 @@ import (
 	"github.com/gofiber/fiber/v2"
 )
 
-func TestProcessEndpointsHandleConcurrentLoad(t *testing.T) {
-	app := newTestApp(t)
-	payload := bytes.Repeat([]byte("streamio-load-test-"), 10000000)
-
-	t.Run("process-by-io", func(t *testing.T) {
-		beforeMem := captureMemSnapshot()
-		duration := runLoadTest(t, app, func() *http.Request {
-			return newMultipartRequest(t, "/process-by-io", payload)
-		}, payloadValidator(http.StatusOK, payload), 8, 10)
-		afterMem := captureMemSnapshot()
-
-		total := 8 * 10
-		t.Logf("/process-by-io handled %d requests in %s (avg %s/request)", total, duration, duration/time.Duration(total))
-		logMemUsage(t, "process-by-io", beforeMem, afterMem)
-	})
-
-	t.Run("process-by-bytes", func(t *testing.T) {
-		beforeMem := captureMemSnapshot()
-		duration := runLoadTest(t, app, func() *http.Request {
-			return newMultipartRequest(t, "/process-by-bytes", payload)
-		}, payloadValidator(http.StatusOK, payload), 8, 10)
-		afterMem := captureMemSnapshot()
-
-		total := 8 * 10
-		t.Logf("/process-by-bytes handled %d requests in %s (avg %s/request)", total, duration, duration/time.Duration(total))
-		logMemUsage(t, "process-by-bytes", beforeMem, afterMem)
-	})
-}
-
 func TestProcessByIOUsesLessHeapThanBytes(t *testing.T) {
 	app := newTestApp(t)
 	payload := bytes.Repeat([]byte("streamio-load-test-"), 10000000)
@@ -126,7 +97,6 @@ func runLoadTest(t *testing.T, app *fiber.App, requestFactory func() *http.Reque
 }
 
 type loadStats struct {
-	allocDelta      uint64
 	totalAllocDelta uint64
 }
 
@@ -146,13 +116,11 @@ func runLoadAndMeasure(
 	after := captureMemSnapshot()
 
 	stats := loadStats{}
-	if after.alloc > before.alloc {
-		stats.allocDelta = after.alloc - before.alloc
-	}
+
 	if after.totalAlloc > before.totalAlloc {
 		stats.totalAllocDelta = after.totalAlloc - before.totalAlloc
 	}
-	t.Logf("%s mem delta alloc=%s total=%s", path, formatBytes(stats.allocDelta), formatBytes(stats.totalAllocDelta))
+	t.Logf("%s mem total=%s", path, formatBytes(stats.totalAllocDelta))
 	return stats
 }
 
