@@ -7,15 +7,27 @@ import (
 	"io"
 	"mime"
 	"mime/multipart"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"errors"
 
+	neturl "net/url"
+
 	"github.com/google/uuid"
 )
+
+var httpClient = &http.Client{Timeout: time.Duration(30) * time.Second}
+
+func SetHTTPClient(c *http.Client) {
+	if c != nil {
+		httpClient = c
+	}
+}
 
 /* ---------- Core Types ---------- */
 
@@ -67,7 +79,7 @@ func newReadStream(rs io.ReadSeeker) Reader {
 	return &readStream{ReadSeeker: rs}
 }
 
-// open streamio.StreamReader
+// OpenReader open streamio.StreamReader
 func OpenReader(src StreamReader) (Reader, error) {
 	if src == nil {
 		return nil, errors.New("nil source")
@@ -79,7 +91,7 @@ func OpenReader(src StreamReader) (Reader, error) {
 	return rs, nil
 }
 
-// open streamio.StreamWriter
+// OpenWriter open streamio.StreamWriter
 func OpenWriter(dest StreamWriter) (Writer, error) {
 	if dest == nil {
 		return nil, errors.New("nil destination")
@@ -255,6 +267,178 @@ func NewBytesStreamReader(name string, data []byte) StreamReader {
 		contentType = "application/octet-stream"
 	}
 	return &bytesStreamReader{name: name, contentType: contentType, data: data}
+}
+
+/* ---------- URL Implementation (StreamReader → TempFile) ---------- */
+
+type urlStreamReader struct {
+	rawURL string
+
+	once sync.Once // ensures the download happens only once
+	tmp  *TempFile // downloaded file stored here
+	meta FileInfo  // cached metadata
+	err  error     // any error during ensure()
+
+	session *session // optional: bind temp file to a session directory
+}
+
+func (s *urlStreamReader) ensure() {
+	s.once.Do(func() {
+		if strings.TrimSpace(s.rawURL) == "" {
+			s.err = fmt.Errorf("empty url")
+			return
+		}
+
+		u, err := neturl.Parse(s.rawURL)
+		if err != nil {
+			s.err = err
+			return
+		}
+		if u.Scheme != "http" && u.Scheme != "https" {
+			s.err = fmt.Errorf("unsupported url scheme: %s", u.Scheme)
+			return
+		}
+
+		// Guess filename from the URL path
+		name := filepath.Base(u.Path)
+		if name == "" || name == "/" || name == "." {
+			name = "download"
+		}
+
+		// Extract file extension; fallback to ".bin"
+		ext := filepath.Ext(name)
+		if ext == "" {
+			ext = ".bin"
+			name += ext
+		}
+
+		// Create temp file: either inside the session directory or OS temp
+		var tmp *TempFile
+		if s.session != nil {
+			// temp file belongs to this session and will be cleaned up when session.Release() runs
+			filename := GenerateFileName(name) // uuid + ext
+			tmp, err = NewTempFileInDir(s.session.dir, "url-", filename)
+		} else {
+			// standalone temp file in OS temp directory
+			tmp, err = NewTempFileWithName("url-", GenerateFileName(name))
+		}
+
+		if err != nil {
+			s.err = err
+			return
+		}
+
+		// Download file
+		resp, err := httpClient.Get(s.rawURL)
+		if err != nil {
+			_ = tmp.Cleanup()
+			s.err = err
+			return
+		}
+		defer resp.Body.Close()
+
+		// Validate HTTP status
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			_ = tmp.Cleanup()
+			s.err = fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+			return
+		}
+
+		// Stream response body → temp file (no large RAM usage)
+		if _, err := io.Copy(tmp, resp.Body); err != nil {
+			_ = tmp.Cleanup()
+			s.err = err
+			return
+		}
+
+		// Determine content-type
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			if guessed := mime.TypeByExtension(ext); guessed != "" {
+				ct = guessed
+			} else {
+				ct = "application/octet-stream"
+			}
+		}
+
+		// If inside a session, register temp file so session.Release() removes it
+		if s.session != nil {
+			s.session.registerTempFile(tmp)
+		}
+
+		s.tmp = tmp
+		s.meta = FileInfo{
+			Name:        filepath.Base(tmp.Path),
+			Size:        tmp.Size(),
+			ContentType: ct,
+		}
+	})
+}
+
+func (s *urlStreamReader) Open() (Reader, error) {
+	s.ensure()
+	if s.err != nil {
+		return nil, s.err
+	}
+	if s.tmp == nil {
+		return nil, fmt.Errorf("url temp file not available")
+	}
+	return s.tmp.Open() // returns Reader (Read + Seek + Close)
+}
+
+func (s *urlStreamReader) Meta() FileInfo {
+	s.ensure()
+	return s.meta
+}
+
+func (s *urlStreamReader) Cleanup() error {
+	// Clear metadata
+	s.meta = FileInfo{}
+
+	if s.tmp != nil {
+		// If not bound to a session, remove temp file immediately.
+		// If bound to a session, let session.Release() do the cleanup.
+		if s.session == nil {
+			_ = s.tmp.Cleanup()
+		}
+		s.tmp = nil
+	}
+
+	// Keep s.err intact to prevent reuse after a failure
+	return nil
+}
+
+// NewUrlStreamReader downloads the file into a temp file in the OS temp directory.
+// The file is NOT attached to any session and must be cleaned manually.
+func NewUrlStreamReader(rawURL string) StreamReader {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	return &urlStreamReader{rawURL: rawURL}
+}
+
+// NewUrlStreamReaderInSession downloads the file into a temp file INSIDE the Session directory.
+// Session.Release() will automatically remove it.
+func NewUrlStreamReaderInSession(sess Session, rawURL string) StreamReader {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil
+	}
+	if sess == nil {
+		return NewUrlStreamReader(rawURL)
+	}
+
+	// Cast into concrete session
+	if ps, ok := sess.(*session); ok {
+		return &urlStreamReader{
+			rawURL:  rawURL,
+			session: ps,
+		}
+	}
+
+	// Fallback if other Session implementations are used
+	return NewUrlStreamReader(rawURL)
 }
 
 /* ---------- TempFile (Auto Cleanup, Read/Write Capable) ---------- */
@@ -460,6 +644,7 @@ func GenerateFileName(fileName string) string {
 	return uuid.New().String() + fileExtension
 }
 
+/*
 // WithTemp lifecycle helper
 func WithTemp(fileExtension string, fn func(*TempFile) error) (err error) {
 	tmp, err := NewTempFileWithName("temp-file-", GenerateFileName(fileExtension))
@@ -483,6 +668,34 @@ func Do(ctx context.Context, outputFileExtension string, doFn func(ctx context.C
 	}
 
 	return &Output{tmp: tmp}, nil
+}
+*/
+
+func NewSession(baseDir string, id string, opts ...SessionOption) (Session, error) {
+	if strings.TrimSpace(baseDir) == "" {
+		return nil, fmt.Errorf("session: baseDir must not be empty")
+	}
+
+	if id == "" {
+		id = uuid.New().String()
+	}
+
+	// Create / ensure the standalone session directory
+	sessionDir := filepath.Join(baseDir, id)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		return nil, err
+	}
+
+	// Create a standalone session (manager = nil)
+	s := &session{
+		id:       id,
+		dir:      sessionDir,
+		manager:  nil, // <--- no manager
+		tmpFiles: make([]*TempFile, 0),
+		writer:   resolveSessionWriterType(OutputTempFile, opts),
+	}
+
+	return s, nil
 }
 
 /* ---------- In-memory StreamWriter (Buffer) ---------- */
@@ -565,6 +778,9 @@ type Output struct {
 }
 
 func (o *Output) AsStreamReader() StreamReader {
+	if o == nil || o.tmp == nil {
+		return nil
+	}
 	return o.tmp.AsStreamReader()
 }
 
@@ -722,7 +938,7 @@ type Session interface {
 
 // IOManager is the root manager for all temp files.
 type IOManager interface {
-	NewSession(id string, opts ...SessionOption) Session
+	NewSession(opts ...SessionOption) Session
 	Release() error // cleanup the entire baseDir
 }
 
@@ -731,7 +947,7 @@ type OutputType string
 
 const (
 	// OutputTempFile stores results on disk (default).
-	OutputTempFile OutputType = "tempfile"
+	OutputTempFile OutputType = "tempFile"
 	// OutputBytes keeps results in memory using a bytes buffer.
 	OutputBytes OutputType = "bytes"
 )
@@ -756,7 +972,7 @@ func resolveSessionWriterType(defaultType OutputType, opts []SessionOption) Outp
 }
 
 // Concrete implementation of IOManager.
-type sessionManager struct {
+type ioManager struct {
 	baseDir       string
 	mu            sync.Mutex
 	sessions      map[string]Session
@@ -774,7 +990,7 @@ func NewIOManager(baseDir ...string) (IOManager, error) {
 			return nil, err
 		}
 
-		return &sessionManager{
+		return &ioManager{
 			baseDir:       processBaseDir,
 			sessions:      make(map[string]Session),
 			removeBaseDir: false, // user-provided baseDir → keep on Release
@@ -787,7 +1003,7 @@ func NewIOManager(baseDir ...string) (IOManager, error) {
 		return nil, err
 	}
 
-	return &sessionManager{
+	return &ioManager{
 		baseDir:       processBaseDir,
 		sessions:      make(map[string]Session),
 		removeBaseDir: true, // temp dir → safe to delete
@@ -795,29 +1011,26 @@ func NewIOManager(baseDir ...string) (IOManager, error) {
 
 }
 
-// processSession is the default implementation of Session.
-type processSession struct {
+// session is the default implementation of Session.
+type session struct {
 	id       string
 	dir      string
-	manager  *sessionManager
+	manager  *ioManager
 	tmpFiles []*TempFile
 	writer   OutputType
 }
 
 // NewSession creates a session under baseDir.
 // Generates a UUID if id == "".
-func (m *sessionManager) NewSession(id string, opts ...SessionOption) Session {
+func (m *ioManager) NewSession(opts ...SessionOption) Session {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if id == "" {
-		id = uuid.New().String()
-	}
-
+	id := uuid.New().String()
 	sessionDir := filepath.Join(m.baseDir, id)
 	_ = os.MkdirAll(sessionDir, 0o755)
 
-	s := &processSession{
+	s := &session{
 		id:       id,
 		dir:      sessionDir,
 		manager:  m,
@@ -830,7 +1043,7 @@ func (m *sessionManager) NewSession(id string, opts ...SessionOption) Session {
 }
 
 // Release removes every session and the SessionManager base directory.
-func (m *sessionManager) Release() error {
+func (m *ioManager) Release() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -871,7 +1084,7 @@ func (m *sessionManager) Release() error {
 
 // Do creates a temp file in this session directory and lets fn write it.
 // outputExt examples: ".pdf", ".zip".
-func (s *processSession) Do(
+func (s *session) Do(
 	ctx context.Context,
 	outputExt string,
 	fn func(ctx context.Context, w StreamWriter) error,
@@ -896,7 +1109,7 @@ func (s *processSession) Do(
 	}
 
 	// Track the temp file for cleanup on Release.
-	s.tmpFiles = append(s.tmpFiles, tmp)
+	s.registerTempFile(tmp)
 
 	// Let the business function write to this file via StreamWriter.
 	if err := fn(ctx, tmp.AsStreamWriter()); err != nil {
@@ -907,7 +1120,7 @@ func (s *processSession) Do(
 	return &Output{tmp: tmp, session: s}, nil
 }
 
-func (s *processSession) DoStream(
+func (s *session) DoStream(
 	ctx context.Context,
 	in StreamReader,
 	outputExt string,
@@ -932,7 +1145,7 @@ func (s *processSession) DoStream(
 	}
 
 	// Track the temp file for cleanup on Release.
-	s.tmpFiles = append(s.tmpFiles, tmp)
+	s.registerTempFile(tmp)
 
 	r, err := OpenReader(in)
 	if err != nil {
@@ -954,7 +1167,7 @@ func (s *processSession) DoStream(
 	return &Output{tmp: tmp, session: s}, nil
 }
 
-func (s *processSession) doStreamInMemory(
+func (s *session) doStreamInMemory(
 	ctx context.Context,
 	in StreamReader,
 	fn func(ctx context.Context, r io.Reader, w io.Writer) error) (*Output, error) {
@@ -983,7 +1196,7 @@ func (s *processSession) doStreamInMemory(
 	return &Output{bytes: result, session: s}, nil
 }
 
-func (s *processSession) Release() error {
+func (s *session) Release() error {
 	var firstErr error
 
 	for _, tmp := range s.tmpFiles {
@@ -1004,7 +1217,14 @@ func (s *processSession) Release() error {
 	return firstErr
 }
 
-func (s *processSession) unregisterTempFile(target *TempFile) {
+func (s *session) registerTempFile(tmp *TempFile) {
+	if tmp == nil {
+		return
+	}
+	s.tmpFiles = append(s.tmpFiles, tmp)
+}
+
+func (s *session) unregisterTempFile(target *TempFile) {
 	if s == nil || target == nil {
 		return
 	}
@@ -1020,7 +1240,7 @@ func (s *processSession) unregisterTempFile(target *TempFile) {
 	s.tmpFiles = newList
 }
 
-func (s *processSession) doInMemory(
+func (s *session) doInMemory(
 	ctx context.Context,
 	fn func(ctx context.Context, w StreamWriter) error,
 ) (*Output, error) {
@@ -1098,4 +1318,10 @@ func NewDownloadReaderCloser(streamReader StreamReader, cleanup ...func()) (Down
 	}
 
 	return closer, nil
+}
+
+func WithSession(m IOManager, fn func(Session) error, opts ...SessionOption) error {
+	s := m.NewSession(opts...)
+	defer s.Release()
+	return fn(s)
 }
