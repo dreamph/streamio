@@ -15,7 +15,6 @@ import (
 	"github.com/dreamph/streamio"
 
 	"github.com/gofiber/fiber/v2"
-	"github.com/google/uuid"
 )
 
 func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
@@ -41,7 +40,7 @@ func newServerApp(ioManager streamio.IOManager) (*fiber.App, error) {
 			outputExt = ".bin"
 		}
 
-		session := ioManager.NewSession(uuid.New().String(), streamio.SessionOption{WriterType: streamio.OutputTempFile})
+		session := ioManager.NewSession(streamio.SessionOption{WriterType: streamio.OutputTempFile})
 		defer session.Release()
 
 		ctx := requestContext(c)
